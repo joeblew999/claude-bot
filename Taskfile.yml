@@ -2,16 +2,13 @@
 
 version: '3'
 
-vars:
-  BINARY: '{{if eq OS "windows"}}claude-bot.exe{{else}}claude-bot{{end}}'
-
 tasks:
   default:
-    desc: Build the binary
+    desc: Build the binary (via Go self-build)
     sources: ["*.go", "go.mod"]
-    generates: ["{{.BINARY}}"]
+    generates: ["claude-bot"]
     cmds:
-      - go build -o {{.BINARY}} .
+      - go run . --build
 
   test:
     desc: Run unit tests
@@ -25,6 +22,11 @@ tasks:
     cmds:
       - go test -v -run TestIntegration -count=1 -timeout 120s
 
+  update:
+    desc: Self-update from latest GitHub release
+    cmds:
+      - go run . --update
+
   start:
     desc: Build and run claude-bot (idempotent — no-op if already running)
     deps: [default]
@@ -33,7 +35,7 @@ tasks:
         if pgrep -f './claude-bot' > /dev/null 2>&1; then
           echo "claude-bot already running"
         else
-          nohup ./{{.BINARY}} >> ~/.claude-bot/bot.log 2>&1 &
+          nohup ./claude-bot >> ~/.claude-bot/bot.log 2>&1 &
           echo "claude-bot started (logs at ~/.claude-bot/bot.log)"
         fi
 
@@ -52,11 +54,5 @@ tasks:
     desc: Remove build artifacts and bot state
     cmds:
       - task: stop
-      - cmd: rm -f {{.BINARY}}
-        platforms: [linux, darwin]
-      - cmd: del /f {{.BINARY}} 2>nul
-        platforms: [windows]
-      - cmd: rm -rf ~/.claude-bot/trees ~/.claude-bot/logs
-        platforms: [linux, darwin]
-      - cmd: rd /s /q "%USERPROFILE%\.claude-bot\trees" "%USERPROFILE%\.claude-bot\logs" 2>nul
-        platforms: [windows]
+      - rm -f claude-bot claude-bot.exe
+      - rm -rf ~/.claude-bot/trees ~/.claude-bot/logs
