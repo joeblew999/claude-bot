@@ -141,10 +141,8 @@ func selfUpdate() {
 		log.Fatalf("[update] no release found (HTTP %d) — run --build to build from source", resp.StatusCode)
 	}
 
-	exe, err := os.Executable()
-	if err != nil {
-		log.Fatalf("[update] can't find current binary: %v", err)
-	}
+	// Always write to ./claude-bot (not os.Executable which may be a go run temp)
+	exe := binaryPath()
 
 	tmp := exe + ".tmp"
 	f, err := os.Create(tmp)
