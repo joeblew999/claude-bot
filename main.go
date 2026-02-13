@@ -21,6 +21,7 @@ import (
 )
 
 // --- Config ---
+// All env vars are prefixed with CB_ to avoid clashes with other tools.
 
 type Config struct {
 	Repos        []string
@@ -48,7 +49,7 @@ func loadConfig() Config {
 		MaxTurns:     50,
 	}
 
-	if v := os.Getenv("REPOS"); v != "" {
+	if v := os.Getenv("CB_REPOS"); v != "" {
 		for _, r := range strings.Split(v, ",") {
 			r = strings.TrimSpace(r)
 			if r != "" {
@@ -56,35 +57,35 @@ func loadConfig() Config {
 			}
 		}
 	}
-	if v := os.Getenv("POLL_INTERVAL"); v != "" {
+	if v := os.Getenv("CB_POLL_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.PollInterval = d
 		}
 	}
-	if v := os.Getenv("WORKERS"); v != "" {
+	if v := os.Getenv("CB_WORKERS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.Workers = n
 		}
 	}
-	if v := os.Getenv("ISSUE_LABEL"); v != "" {
+	if v := os.Getenv("CB_ISSUE_LABEL"); v != "" {
 		cfg.IssueLabel = v
 	}
-	if v := os.Getenv("WIP_LABEL"); v != "" {
+	if v := os.Getenv("CB_WIP_LABEL"); v != "" {
 		cfg.WIPLabel = v
 	}
-	if v := os.Getenv("DONE_LABEL"); v != "" {
+	if v := os.Getenv("CB_DONE_LABEL"); v != "" {
 		cfg.DoneLabel = v
 	}
-	if v := os.Getenv("WORKTREE_DIR"); v != "" {
+	if v := os.Getenv("CB_WORKTREE_DIR"); v != "" {
 		cfg.WorktreeDir = expandHome(v)
 	}
-	if v := os.Getenv("REPO_DIR"); v != "" {
+	if v := os.Getenv("CB_REPO_DIR"); v != "" {
 		cfg.RepoDir = expandHome(v)
 	}
-	if v := os.Getenv("LOG_DIR"); v != "" {
+	if v := os.Getenv("CB_LOG_DIR"); v != "" {
 		cfg.LogDir = expandHome(v)
 	}
-	if v := os.Getenv("MAX_TURNS"); v != "" {
+	if v := os.Getenv("CB_MAX_TURNS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.MaxTurns = n
 		}
@@ -160,17 +161,17 @@ func (t *tracker) release(key string) {
 // --- Dependency Check ---
 
 // checkDependencies verifies all required external tools are installed and configured.
-// With AUTO_INSTALL=1, it will attempt to install missing tools automatically.
+// With CB_AUTO_INSTALL=1, it will attempt to install missing tools automatically.
 // Idempotent: skips tools that are already installed.
 func checkDependencies() {
-	autoInstall := os.Getenv("AUTO_INSTALL") == "1"
+	autoInstall := os.Getenv("CB_AUTO_INSTALL") == "1"
 
 	// Detect package manager (idempotent — just reads state)
 	var pm string
 	if autoInstall {
 		pm = detectPackageManager()
 		if pm == "" {
-			log.Fatal("AUTO_INSTALL=1 but no supported package manager found (need brew, apt, or dnf)")
+			log.Fatal("CB_AUTO_INSTALL=1 but no supported package manager found (need brew, apt, or dnf)")
 		}
 		log.Printf("auto-install enabled, using %s", pm)
 	}
@@ -219,7 +220,7 @@ func checkDependencies() {
 	}
 
 	if len(manual) > 0 {
-		log.Fatalf("missing required dependencies (set AUTO_INSTALL=1 to auto-install where possible):\n  - %s", strings.Join(manual, "\n  - "))
+		log.Fatalf("missing required dependencies (set CB_AUTO_INSTALL=1 to auto-install where possible):\n  - %s", strings.Join(manual, "\n  - "))
 	}
 
 	log.Println("dependency check passed: git, gh, claude all available")
@@ -291,14 +292,20 @@ func installNpm(pkg string) {
 func main() {
 	cfg := loadConfig()
 
-	// Handle --clean: remove all working directories
-	if len(os.Args) > 1 && os.Args[1] == "--clean" {
-		cleanAll(cfg)
-		return
+	// Handle clean commands
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--clean":
+			cleanState(cfg)
+			return
+		case "--clean-all":
+			cleanEverything(cfg)
+			return
+		}
 	}
 
 	if len(cfg.Repos) == 0 {
-		log.Fatal("REPOS environment variable is required (comma-separated list of owner/repo)")
+		log.Fatal("CB_REPOS environment variable is required (comma-separated list of owner/repo)")
 	}
 
 	// Idempotent dependency check — verifies required tools are installed and configured
@@ -436,14 +443,17 @@ func processIssue(ctx context.Context, cfg Config, workerID int, issue Issue) (r
 	wtDir := filepath.Join(cfg.WorktreeDir, issue.Repo, branch)
 	logFile := filepath.Join(cfg.LogDir, fmt.Sprintf("%s-%d.log", slugify(issue.Repo), issue.Number))
 
-	// On failure: comment error on issue, reset labels, cleanup
+	// On failure: comment error on issue (deduped), reset labels, cleanup
 	defer func() {
 		if retErr != nil {
 			commentErr := fmt.Sprintf("claude-bot encountered an error:\n```\n%s\n```\nNeeds manual attention.", retErr.Error())
-			_ = commentOnIssue(ctx, issue, commentErr)
+			// Only comment if we haven't already posted this exact error
+			if !lastCommentContains(ctx, issue, retErr.Error()) {
+				_ = commentOnIssue(ctx, issue, commentErr)
+			}
 			_ = removeLabel(ctx, issue, cfg.WIPLabel)
 			_ = addLabel(ctx, issue, cfg.IssueLabel)
-			cleanupWorktree(ctx, repoDir, wtDir)
+			cleanupWorktree(ctx, repoDir, wtDir, branch)
 		}
 	}()
 
@@ -495,7 +505,7 @@ func processIssue(ctx context.Context, cfg Config, workerID int, issue Issue) (r
 		_ = commentOnIssue(ctx, issue, "claude-bot ran but couldn't resolve this issue — no file changes were made. Needs manual attention.")
 		_ = removeLabel(ctx, issue, cfg.WIPLabel)
 		_ = addLabel(ctx, issue, cfg.IssueLabel)
-		cleanupWorktree(ctx, repoDir, wtDir)
+		cleanupWorktree(ctx, repoDir, wtDir, branch)
 		return nil // Not an error, just nothing to do
 	}
 
@@ -527,7 +537,7 @@ func processIssue(ctx context.Context, cfg Config, workerID int, issue Issue) (r
 	}
 
 	// Step 12: Cleanup worktree
-	cleanupWorktree(ctx, repoDir, wtDir)
+	cleanupWorktree(ctx, repoDir, wtDir, branch)
 
 	log.Printf("[worker-%d] completed %s → %s", workerID, issue.key(), prURL)
 	return nil
@@ -555,7 +565,7 @@ func ensureRepoCloned(ctx context.Context, cfg Config, issue Issue) error {
 }
 
 func ensureWorktree(ctx context.Context, repoDir, wtDir, branch string) error {
-	// Already exists?
+	// Already exists as a worktree?
 	if _, err := os.Stat(wtDir); err == nil {
 		return nil
 	}
@@ -571,13 +581,28 @@ func ensureWorktree(ctx context.Context, repoDir, wtDir, branch string) error {
 
 	// Check if branch already exists remotely
 	if _, err := run(ctx, repoDir, "git", "rev-parse", "--verify", "refs/remotes/origin/"+branch); err == nil {
-		// Branch exists remotely — check it out
+		// Branch exists remotely — delete stale local branch if any, then check it out
+		_ = deleteLocalBranch(ctx, repoDir, branch)
 		_, err := run(ctx, repoDir, "git", "worktree", "add", wtDir, branch)
 		return err
 	}
 
+	// Delete stale local branch if it exists (left over from a previous failed run)
+	_ = deleteLocalBranch(ctx, repoDir, branch)
+
 	// Create new worktree with new branch from origin/defaultBranch
 	_, err := run(ctx, repoDir, "git", "worktree", "add", "-b", branch, wtDir, "origin/"+defaultBranch)
+	return err
+}
+
+// deleteLocalBranch removes a local branch if it exists.
+// Idempotent: silently succeeds if branch doesn't exist.
+func deleteLocalBranch(ctx context.Context, repoDir, branch string) error {
+	// Check if branch exists locally
+	if _, err := run(ctx, repoDir, "git", "rev-parse", "--verify", "refs/heads/"+branch); err != nil {
+		return nil // Branch doesn't exist, nothing to do
+	}
+	_, err := run(ctx, repoDir, "git", "branch", "-D", branch)
 	return err
 }
 
@@ -676,6 +701,9 @@ func runClaude(ctx context.Context, cfg Config, issue Issue, wtDir, logFile stri
 	)
 	cmd.Dir = wtDir
 
+	// Clear CLAUDECODE env var so claude doesn't think it's nested
+	cmd.Env = filterEnv(os.Environ(), "CLAUDECODE")
+
 	// Capture output to log file
 	f, err := os.Create(logFile)
 	if err != nil {
@@ -697,6 +725,18 @@ func runClaude(ctx context.Context, cfg Config, issue Issue, wtDir, logFile stri
 	}
 
 	return nil
+}
+
+// filterEnv returns env vars with the specified key removed.
+func filterEnv(env []string, key string) []string {
+	prefix := key + "="
+	filtered := make([]string, 0, len(env))
+	for _, e := range env {
+		if !strings.HasPrefix(e, prefix) {
+			filtered = append(filtered, e)
+		}
+	}
+	return filtered
 }
 
 // --- GitHub Label/Comment Helpers ---
@@ -728,13 +768,38 @@ func commentOnIssue(ctx context.Context, issue Issue, body string) error {
 	return err
 }
 
-func cleanupWorktree(ctx context.Context, repoDir, wtDir string) {
+// lastCommentContains checks if the most recent comment on an issue contains the given text.
+// Used to prevent duplicate error comments on retries.
+func lastCommentContains(ctx context.Context, issue Issue, text string) bool {
+	out, err := run(ctx, "", "gh", "issue", "view",
+		strconv.Itoa(issue.Number),
+		"--repo", issue.Repo,
+		"--json", "comments",
+	)
+	if err != nil {
+		return false
+	}
+	var result struct {
+		Comments []Comment `json:"comments"`
+	}
+	if json.Unmarshal([]byte(out), &result) != nil || len(result.Comments) == 0 {
+		return false
+	}
+	last := result.Comments[len(result.Comments)-1]
+	return strings.Contains(last.Body, text)
+}
+
+// cleanupWorktree removes a worktree and its local branch.
+// Idempotent: skips if worktree doesn't exist.
+func cleanupWorktree(ctx context.Context, repoDir, wtDir, branch string) {
 	if _, err := os.Stat(wtDir); os.IsNotExist(err) {
 		return
 	}
 	if _, err := run(ctx, repoDir, "git", "worktree", "remove", wtDir, "--force"); err != nil {
 		log.Printf("[cleanup] warning: couldn't remove worktree %s: %v", wtDir, err)
 	}
+	// Also delete the local branch to prevent stale branch errors on retry
+	_ = deleteLocalBranch(ctx, repoDir, branch)
 }
 
 // --- Command Runner ---
@@ -755,18 +820,30 @@ func run(ctx context.Context, dir string, name string, args ...string) (string, 
 
 // --- Clean ---
 
-// cleanAll removes all claude-bot working directories (repos, worktrees, logs).
+// cleanState removes worktrees and logs but preserves repo clones.
+// Use this to reset working state so the next run re-tests deps and starts fresh.
 // Idempotent: skips directories that don't exist.
-func cleanAll(cfg Config) {
-	dirs := []struct {
-		name string
-		path string
-	}{
+func cleanState(cfg Config) {
+	removeDirs([]struct{ name, path string }{
+		{"worktrees", cfg.WorktreeDir},
+		{"logs", cfg.LogDir},
+	})
+	log.Println("[clean] done — repo clones preserved in", cfg.RepoDir)
+}
+
+// cleanEverything removes all claude-bot directories including repo clones.
+// Full factory reset of ~/.claude-bot/.
+// Idempotent: skips directories that don't exist.
+func cleanEverything(cfg Config) {
+	removeDirs([]struct{ name, path string }{
 		{"worktrees", cfg.WorktreeDir},
 		{"repos", cfg.RepoDir},
 		{"logs", cfg.LogDir},
-	}
+	})
+	log.Println("[clean-all] done — full reset")
+}
 
+func removeDirs(dirs []struct{ name, path string }) {
 	for _, d := range dirs {
 		if _, err := os.Stat(d.path); os.IsNotExist(err) {
 			log.Printf("[clean] %s: %s (not found, skipping)", d.name, d.path)
@@ -778,8 +855,6 @@ func cleanAll(cfg Config) {
 			log.Printf("[clean] removed %s: %s", d.name, d.path)
 		}
 	}
-
-	log.Println("[clean] done")
 }
 
 // --- Helpers ---

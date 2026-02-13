@@ -38,6 +38,15 @@ Single Go binary that watches GitHub repos for `todo`-labeled issues, runs Claud
          └────────────────────────────┘
 ```
 
+## Quick Start
+
+```bash
+# Edit run.sh to set your repos, then:
+./run.sh
+```
+
+The launcher builds the binary, auto-installs missing tools, and starts the bot.
+
 ## Prerequisites
 
 - **Go 1.25+** (for building)
@@ -45,44 +54,45 @@ Single Go binary that watches GitHub repos for `todo`-labeled issues, runs Claud
 - **gh** (GitHub CLI) authenticated via `gh auth login`
 - **claude** (Claude Code CLI) authenticated to your subscription
 
-All prerequisites are checked at startup. Set `AUTO_INSTALL=1` to auto-install missing tools:
+Missing tools are **automatically installed** at startup when `CB_AUTO_INSTALL=1` (the default in `run.sh`):
 
-```bash
-AUTO_INSTALL=1 REPOS="owner/repo" ./claude-bot
-```
+| Tool | Install method |
+|------|---------------|
+| `git` | `brew` / `apt` / `dnf` (OS-detected) |
+| `gh` | `brew` / `apt` / `dnf` (OS-detected) |
+| `claude` | `npm install -g @anthropic-ai/claude-code` |
 
-Auto-install uses `brew` (macOS), `apt`/`dnf` (Linux) for git and gh, and `npm` for claude.
-Things that require human input (git identity, gh auth) are flagged with instructions.
+Things that need human input (git identity, gh auth) are flagged with clear instructions.
 
-## Build & Run
+## Build & Run (manual)
 
 ```bash
 go build -o claude-bot .
-REPOS="owner/repo1,owner/repo2" ./claude-bot
+CB_REPOS="owner/repo1,owner/repo2" ./claude-bot
 ```
 
 ## Configuration
 
-All via environment variables:
+All env vars are prefixed with `CB_` to avoid clashes with other tools:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `REPOS` | *(required)* | Comma-separated repos to watch (`owner/repo`) |
-| `POLL_INTERVAL` | `30s` | How often to check for new issues |
-| `WORKERS` | `3` | Max parallel Claude Code instances |
-| `ISSUE_LABEL` | `todo` | Label that triggers pickup |
-| `WIP_LABEL` | `in-progress` | Label applied while working |
-| `DONE_LABEL` | `done` | Label applied when PR is created |
-| `WORKTREE_DIR` | `~/.claude-bot/trees` | Where git worktrees live |
-| `REPO_DIR` | `~/.claude-bot/repos` | Where repo clones live |
-| `LOG_DIR` | `~/.claude-bot/logs` | Per-issue log files |
-| `MAX_TURNS` | `50` | Claude Code `--max-turns` flag |
-| `AUTO_INSTALL` | *(off)* | Set to `1` to auto-install missing deps |
+| `CB_REPOS` | *(required)* | Comma-separated repos to watch (`owner/repo`) |
+| `CB_POLL_INTERVAL` | `30s` | How often to check for new issues |
+| `CB_WORKERS` | `3` | Max parallel Claude Code instances |
+| `CB_ISSUE_LABEL` | `todo` | Label that triggers pickup |
+| `CB_WIP_LABEL` | `in-progress` | Label applied while working |
+| `CB_DONE_LABEL` | `done` | Label applied when PR is created |
+| `CB_WORKTREE_DIR` | `~/.claude-bot/trees` | Where git worktrees live |
+| `CB_REPO_DIR` | `~/.claude-bot/repos` | Where repo clones live |
+| `CB_LOG_DIR` | `~/.claude-bot/logs` | Per-issue log files |
+| `CB_MAX_TURNS` | `50` | Claude Code `--max-turns` flag |
+| `CB_AUTO_INSTALL` | *(off)* | Set to `1` to auto-install missing deps |
 
 ## Usage
 
-1. Add the `todo` label to an issue on any repo in `REPOS`
-2. The bot picks it up within `POLL_INTERVAL`, labels it `in-progress`
+1. Add the `todo` label to an issue on any repo in `CB_REPOS`
+2. The bot picks it up within `CB_POLL_INTERVAL`, labels it `in-progress`
 3. Claude Code works on the issue in an isolated git worktree
 4. Bot commits, pushes, and creates a PR
 5. Bot comments the PR link on the issue and labels it `done`
@@ -99,32 +109,39 @@ Every operation is safe to repeat. If you kill the process and restart:
 - Existing branches get checked out, not re-created
 - Existing PRs don't get duplicated
 - Existing comments don't get re-posted
+- Stale local branches from failed runs are automatically cleaned up
 
 ## Error Handling
 
 - **Claude timeout:** Killed after 10 minutes. Issue gets error comment, labels reset to `todo`.
 - **Claude no changes:** Issue gets "couldn't resolve" comment, labels reset to `todo`.
-- **Any step failure:** Error commented on issue, labels reset, worktree cleaned up, worker moves on.
+- **Any step failure:** Error commented on issue, labels reset, worktree + stale branch cleaned up, worker moves on.
 
 ## Running in the Background
 
 ```bash
 # tmux (recommended — Claude Code needs a TTY-like environment)
-tmux new-session -d -s claude-bot 'REPOS="owner/repo" ./claude-bot'
+tmux new-session -d -s claude-bot './run.sh'
 
 # Or nohup
-nohup ./claude-bot > ~/.claude-bot/bot.log 2>&1 &
+CB_REPOS="owner/repo" nohup ./claude-bot > ~/.claude-bot/bot.log 2>&1 &
 ```
 
 ## Clean Up
 
-Remove all claude-bot working directories (repos, worktrees, logs):
+Two clean commands for different purposes:
 
 ```bash
+# Remove worktrees and logs (keeps repo clones, re-tests deps on next run)
 ./claude-bot --clean
+
+# Full reset: remove everything including repo clones
+./claude-bot --clean-all
 ```
 
-Idempotent — skips directories that don't exist.
+`--clean` is what you want most of the time — it clears working state so the next run starts fresh, re-checks dependencies, and re-clones repos only if needed.
+
+`--clean-all` is a full factory reset of `~/.claude-bot/`.
 
 ## What This Does NOT Do
 
