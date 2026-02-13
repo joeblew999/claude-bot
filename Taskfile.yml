@@ -56,8 +56,13 @@ tasks:
       - task: start
 
   clean:
-    desc: Remove build artifacts and bot state
+    desc: Remove bot state (worktrees, logs)
     cmds:
       - task: stop
-      - rm -f claude-bot claude-bot.exe
-      - rm -rf ~/.claude-bot/trees ~/.claude-bot/logs
+      - go run . --clean
+
+  clean-all:
+    desc: Full reset (worktrees, repos, logs)
+    cmds:
+      - task: stop
+      - go run . --clean-all
