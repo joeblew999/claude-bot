@@ -24,29 +24,42 @@ import (
 // All env vars are prefixed with CB_ to avoid clashes with other tools.
 
 type Config struct {
-	Repos        []string
-	PollInterval time.Duration
-	Workers      int
-	IssueLabel   string
-	WIPLabel     string
-	DoneLabel    string
-	WorktreeDir  string
-	RepoDir      string
-	LogDir       string
-	MaxTurns     int
+	Repos          []string
+	PollInterval   time.Duration
+	Workers        int
+	IssueLabel     string
+	WIPLabel       string
+	DoneLabel      string
+	NeedsInfoLabel string
+	FailedLabel    string
+	TriageLabel    string
+	Triage         bool
+	WorktreeDir    string
+	RepoDir        string
+	LogDir         string
+	MaxTurns       int
+	MaxRetries     int
 }
 
 func loadConfig() Config {
+	// Load .env file if present (no external deps, just parse KEY=VALUE lines)
+	loadDotEnv()
+
 	cfg := Config{
-		PollInterval: 30 * time.Second,
-		Workers:      3,
-		IssueLabel:   "todo",
-		WIPLabel:     "in-progress",
-		DoneLabel:    "done",
-		WorktreeDir:  expandHome("~/.claude-bot/trees"),
-		RepoDir:      expandHome("~/.claude-bot/repos"),
-		LogDir:       expandHome("~/.claude-bot/logs"),
-		MaxTurns:     50,
+		PollInterval:   30 * time.Second,
+		Workers:        3,
+		IssueLabel:     "todo",
+		WIPLabel:       "in-progress",
+		DoneLabel:      "done",
+		NeedsInfoLabel: "needs-info",
+		FailedLabel:    "failed",
+		TriageLabel:    "triaged",
+		Triage:         false,
+		WorktreeDir:    expandHome("~/.claude-bot/trees"),
+		RepoDir:        expandHome("~/.claude-bot/repos"),
+		LogDir:         expandHome("~/.claude-bot/logs"),
+		MaxTurns:       50,
+		MaxRetries:     3,
 	}
 
 	if v := os.Getenv("CB_REPOS"); v != "" {
@@ -76,6 +89,12 @@ func loadConfig() Config {
 	if v := os.Getenv("CB_DONE_LABEL"); v != "" {
 		cfg.DoneLabel = v
 	}
+	if v := os.Getenv("CB_NEEDS_INFO_LABEL"); v != "" {
+		cfg.NeedsInfoLabel = v
+	}
+	if v := os.Getenv("CB_FAILED_LABEL"); v != "" {
+		cfg.FailedLabel = v
+	}
 	if v := os.Getenv("CB_WORKTREE_DIR"); v != "" {
 		cfg.WorktreeDir = expandHome(v)
 	}
@@ -89,6 +108,17 @@ func loadConfig() Config {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.MaxTurns = n
 		}
+	}
+	if v := os.Getenv("CB_MAX_RETRIES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.MaxRetries = n
+		}
+	}
+	if v := os.Getenv("CB_TRIAGE_LABEL"); v != "" {
+		cfg.TriageLabel = v
+	}
+	if os.Getenv("CB_TRIAGE") == "1" {
+		cfg.Triage = true
 	}
 
 	return cfg
@@ -104,6 +134,9 @@ type Issue struct {
 	Labels   []Label   `json:"labels"`
 	URL      string    `json:"url"`
 	Comments []Comment `json:"comments"`
+	Author   struct {
+		Login string `json:"login"`
+	} `json:"author"`
 }
 
 type Label struct {
@@ -208,6 +241,10 @@ func checkDependencies() {
 		if err := exec.Command("gh", "auth", "status").Run(); err != nil {
 			manual = append(manual, "gh auth (run: gh auth login)")
 		}
+		// Upgrade gh to latest if auto-install is on
+		if autoInstall {
+			upgradePackage(pm, "gh")
+		}
 	}
 
 	// --- claude (Claude Code CLI) ---
@@ -270,12 +307,42 @@ func installPackage(pm, pkg string) {
 	log.Printf("installed %s successfully", pkg)
 }
 
-// installNpm installs a global npm package.
-// Idempotent: npm skips if already installed at latest version.
+// upgradePackage upgrades an already-installed package to latest.
+// Idempotent: no-op if already at latest version.
+func upgradePackage(pm, pkg string) {
+	var cmd *exec.Cmd
+	switch pm {
+	case "brew":
+		cmd = exec.Command("brew", "upgrade", pkg)
+	case "apt":
+		cmd = exec.Command("sudo", "apt-get", "install", "--only-upgrade", "-y", pkg)
+	case "dnf":
+		cmd = exec.Command("sudo", "dnf", "upgrade", "-y", pkg)
+	default:
+		return
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Printf("warning: couldn't upgrade %s: %v", pkg, err)
+	}
+}
+
+// installNpm installs a global package. Prefers bun, falls back to npm.
 func installNpm(pkg string) {
-	// Need npm to install
+	if _, err := exec.LookPath("bun"); err == nil {
+		log.Printf("installing %s via bun...", pkg)
+		cmd := exec.Command("bun", "install", "-g", pkg)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err == nil {
+			log.Printf("installed %s via bun", pkg)
+			return
+		}
+		log.Printf("bun failed, falling back to npm")
+	}
 	if _, err := exec.LookPath("npm"); err != nil {
-		log.Fatalf("cannot auto-install %s: npm not found (install Node.js first)", pkg)
+		log.Fatalf("cannot auto-install %s: neither bun nor npm found", pkg)
 	}
 	log.Printf("installing %s via npm...", pkg)
 	cmd := exec.Command("npm", "install", "-g", pkg)
@@ -284,7 +351,7 @@ func installNpm(pkg string) {
 	if err := cmd.Run(); err != nil {
 		log.Fatalf("failed to install %s: %v", pkg, err)
 	}
-	log.Printf("installed %s successfully", pkg)
+	log.Printf("installed %s via npm", pkg)
 }
 
 // --- Main ---
@@ -313,11 +380,15 @@ func main() {
 
 	ensureDirs(cfg)
 
-	log.Printf("claude-bot starting: repos=%v workers=%d poll=%s",
-		cfg.Repos, cfg.Workers, cfg.PollInterval)
+	log.Printf("claude-bot starting: repos=%v workers=%d poll=%s retries=%d",
+		cfg.Repos, cfg.Workers, cfg.PollInterval, cfg.MaxRetries)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// Startup: create labels if missing, recover stale issues
+	ensureLabels(ctx, cfg)
+	recoverStaleIssues(ctx, cfg)
 
 	jobs := make(chan Issue, 100)
 	t := newTracker()
@@ -366,6 +437,11 @@ func poll(ctx context.Context, cfg Config, jobs chan<- Issue, t *tracker) {
 			return
 		}
 
+		// Triage: find unlabeled issues and respond
+		if cfg.Triage {
+			triageNewIssues(ctx, cfg, repo)
+		}
+
 		issues, err := fetchIssues(ctx, repo, cfg.IssueLabel)
 		if err != nil {
 			log.Printf("[poll] error fetching issues from %s: %v", repo, err)
@@ -373,8 +449,16 @@ func poll(ctx context.Context, cfg Config, jobs chan<- Issue, t *tracker) {
 		}
 
 		for _, issue := range issues {
-			// Skip if already has WIP or done label
-			if issue.hasLabel(cfg.WIPLabel) || issue.hasLabel(cfg.DoneLabel) {
+			// Skip if already has WIP, done, or failed label
+			if issue.hasLabel(cfg.WIPLabel) || issue.hasLabel(cfg.DoneLabel) || issue.hasLabel(cfg.FailedLabel) {
+				continue
+			}
+
+			// Retry limit: if too many bot errors, mark as failed and skip
+			if errors := countBotErrors(issue); errors >= cfg.MaxRetries {
+				log.Printf("[poll] %s has failed %d times (max %d), marking as failed", issue.key(), errors, cfg.MaxRetries)
+				_ = addLabel(ctx, issue, cfg.FailedLabel)
+				_ = removeLabel(ctx, issue, cfg.IssueLabel)
 				continue
 			}
 
@@ -395,12 +479,15 @@ func poll(ctx context.Context, cfg Config, jobs chan<- Issue, t *tracker) {
 }
 
 func fetchIssues(ctx context.Context, repo, label string) ([]Issue, error) {
-	out, err := run(ctx, "", "gh", "issue", "list",
-		"--repo", repo,
-		"--label", label,
-		"--json", "number,title,body,labels,url,comments",
+	args := []string{"issue", "list", "--repo", repo,
+		"--json", "number,title,body,labels,url,comments,author",
 		"--limit", "50",
-	)
+	}
+	if label != "" {
+		args = append(args, "--label", label)
+	}
+
+	out, err := run(ctx, "", "gh", args...)
 	if err != nil {
 		return nil, err
 	}
@@ -410,12 +497,96 @@ func fetchIssues(ctx context.Context, repo, label string) ([]Issue, error) {
 		return nil, fmt.Errorf("parsing issues JSON: %w", err)
 	}
 
-	// Set repo on each issue
 	for i := range issues {
 		issues[i].Repo = repo
 	}
 
 	return issues, nil
+}
+
+// --- Triage ---
+
+// triageNewIssues finds open issues with no bot labels and posts a friendly response.
+// Idempotent: adds TriageLabel after responding so we don't re-triage.
+func triageNewIssues(ctx context.Context, cfg Config, repo string) {
+	issues, err := fetchIssues(ctx, repo, "")
+	if err != nil {
+		log.Printf("[triage] error fetching issues from %s: %v", repo, err)
+		return
+	}
+
+	botLabels := []string{
+		cfg.IssueLabel, cfg.WIPLabel, cfg.DoneLabel,
+		cfg.NeedsInfoLabel, cfg.FailedLabel, cfg.TriageLabel,
+	}
+
+	for _, issue := range issues {
+		// Skip if issue already has any bot label
+		hasBotLabel := false
+		for _, bl := range botLabels {
+			if issue.hasLabel(bl) {
+				hasBotLabel = true
+				break
+			}
+		}
+		if hasBotLabel {
+			continue
+		}
+
+		// Skip if bot already commented
+		if hasBotComment(issue) {
+			_ = addLabel(ctx, issue, cfg.TriageLabel)
+			continue
+		}
+
+		log.Printf("[triage] responding to %s: %q", issue.key(), issue.Title)
+
+		response := buildTriageResponse(ctx, issue)
+		if err := commentOnIssue(ctx, issue, response); err != nil {
+			log.Printf("[triage] error commenting on %s: %v", issue.key(), err)
+			continue
+		}
+		_ = addLabel(ctx, issue, cfg.TriageLabel)
+	}
+}
+
+// hasBotComment checks if claude-bot has already commented on the issue.
+func hasBotComment(issue Issue) bool {
+	for _, c := range issue.Comments {
+		if strings.Contains(c.Body, "claude-bot") {
+			return true
+		}
+	}
+	return false
+}
+
+// buildTriageResponse uses Claude CLI to generate a context-aware, human-sounding
+// triage response based on the issue content. Falls back to a simple response if Claude fails.
+func buildTriageResponse(ctx context.Context, issue Issue) string {
+	prompt := fmt.Sprintf(`You are responding to a GitHub issue as a helpful project contributor.
+Write a short, friendly, human-sounding reply. DO NOT say you are a bot. DO NOT use phrases like "I'm an AI" or "automated".
+Just respond naturally as if you're a person on the team who read their issue.
+
+- If they asked a question, try to help or point them in the right direction.
+- If they reported a bug, acknowledge it and ask for more details if the report is thin.
+- If they requested a feature, acknowledge the idea.
+- Keep it to 2-4 sentences max. Be warm but concise.
+- End by letting them know a maintainer will look at this soon, and if it's something actionable, it can be picked up for work.
+
+Issue title: %s
+Issue author: @%s
+Issue body:
+%s`, issue.Title, issue.Author.Login, issue.Body)
+
+	cmd := exec.CommandContext(ctx, "claude", "-p", prompt, "--max-turns", "1")
+	cmd.Env = filterEnv(os.Environ(), "CLAUDECODE")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("[triage] claude failed, using fallback: %v", err)
+		return fmt.Sprintf("Hey @%s, thanks for raising this! A maintainer will take a look soon.", issue.Author.Login)
+	}
+
+	return strings.TrimSpace(string(out))
 }
 
 // --- Worker ---
@@ -500,11 +671,11 @@ func processIssue(ctx context.Context, cfg Config, workerID int, issue Issue) (r
 		}
 	}
 
-	// Step 6: No changes → report and cleanup
+	// Step 6: No changes → needs more info from user
 	if !hasChanges {
-		_ = commentOnIssue(ctx, issue, "claude-bot ran but couldn't resolve this issue — no file changes were made. Needs manual attention.")
+		_ = commentOnIssue(ctx, issue, "claude-bot ran but couldn't resolve this issue — no file changes were made.\n\nPlease add more context or details as a comment, then replace the `"+cfg.NeedsInfoLabel+"` label with `"+cfg.IssueLabel+"` to retry.")
 		_ = removeLabel(ctx, issue, cfg.WIPLabel)
-		_ = addLabel(ctx, issue, cfg.IssueLabel)
+		_ = addLabel(ctx, issue, cfg.NeedsInfoLabel)
 		cleanupWorktree(ctx, repoDir, wtDir, branch)
 		return nil // Not an error, just nothing to do
 	}
@@ -904,6 +1075,31 @@ func branchName(issue Issue) string {
 	return fmt.Sprintf("issue-%d-%s", issue.Number, slug)
 }
 
+// loadDotEnv reads .env from the binary's directory. No-op if missing.
+// Stdlib only — no external deps. Only sets vars not already in the environment.
+func loadDotEnv() {
+	data, err := os.ReadFile(".env")
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		// Don't override existing env vars
+		if os.Getenv(k) == "" {
+			os.Setenv(k, v)
+		}
+	}
+}
+
 func expandHome(path string) string {
 	if strings.HasPrefix(path, "~/") {
 		home, err := os.UserHomeDir()
@@ -921,4 +1117,74 @@ func ensureDirs(cfg Config) {
 			log.Fatalf("failed to create directory %s: %v", dir, err)
 		}
 	}
+}
+
+// ensureLabels creates the required labels on each repo if they don't exist.
+// Idempotent: gh label create errors if label already exists, which we ignore.
+func ensureLabels(ctx context.Context, cfg Config) {
+	labels := []struct{ name, color, desc string }{
+		{cfg.IssueLabel, "0E8A16", "Issue ready for claude-bot"},
+		{cfg.WIPLabel, "FBCA04", "claude-bot is working on this"},
+		{cfg.DoneLabel, "1D76DB", "claude-bot created a PR"},
+		{cfg.NeedsInfoLabel, "D93F0B", "claude-bot needs more context"},
+		{cfg.FailedLabel, "B60205", "claude-bot failed after max retries"},
+		{cfg.TriageLabel, "C5DEF5", "claude-bot triaged this issue"},
+	}
+	for _, repo := range cfg.Repos {
+		for _, l := range labels {
+			if _, err := run(ctx, "", "gh", "label", "create", l.name,
+				"--repo", repo,
+				"--color", l.color,
+				"--description", l.desc,
+			); err != nil {
+				continue // Label already exists — fine
+			}
+			log.Printf("[labels] created %q on %s", l.name, repo)
+		}
+	}
+}
+
+// recoverStaleIssues resets issues stuck in "in-progress" with no PR back to "todo".
+// Called on startup before workers start, so there's no race condition.
+func recoverStaleIssues(ctx context.Context, cfg Config) {
+	for _, repo := range cfg.Repos {
+		issues, err := fetchIssues(ctx, repo, cfg.WIPLabel)
+		if err != nil {
+			log.Printf("[recovery] error checking stale issues in %s: %v", repo, err)
+			continue
+		}
+		for _, issue := range issues {
+			branch := branchName(issue)
+			// Check if a PR already exists
+			out, _ := run(ctx, "", "gh", "pr", "list",
+				"--repo", issue.Repo,
+				"--head", branch,
+				"--json", "url",
+				"--limit", "1",
+			)
+			var prs []struct{ URL string `json:"url"` }
+			if json.Unmarshal([]byte(out), &prs) == nil && len(prs) > 0 {
+				// PR exists — mark done
+				log.Printf("[recovery] %s has PR, marking done", issue.key())
+				_ = addLabel(ctx, issue, cfg.DoneLabel)
+				_ = removeLabel(ctx, issue, cfg.WIPLabel)
+				continue
+			}
+			// No PR — reset to todo
+			log.Printf("[recovery] %s stuck in-progress with no PR, resetting to todo", issue.key())
+			_ = removeLabel(ctx, issue, cfg.WIPLabel)
+			_ = addLabel(ctx, issue, cfg.IssueLabel)
+		}
+	}
+}
+
+// countBotErrors counts how many error comments the bot has posted on an issue.
+func countBotErrors(issue Issue) int {
+	count := 0
+	for _, c := range issue.Comments {
+		if strings.Contains(c.Body, "claude-bot encountered an error:") {
+			count++
+		}
+	}
+	return count
 }

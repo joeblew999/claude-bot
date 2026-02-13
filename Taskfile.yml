@@ -1,0 +1,76 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+
+version: '3'
+
+vars:
+  BINARY: '{{if eq OS "windows"}}claude-bot.exe{{else}}claude-bot{{end}}'
+  PID_FILE: '.claude-bot.pid'
+
+tasks:
+  default:
+    desc: Build the binary
+    sources: ["*.go", "go.mod"]
+    generates: ["{{.BINARY}}"]
+    cmds:
+      - go build -o {{.BINARY}} .
+
+  test:
+    desc: Run unit tests
+    cmds:
+      - go test -v -count=1 ./...
+
+  test-integration:
+    desc: Run integration tests (creates/deletes a test repo on GitHub)
+    env:
+      CB_INTEGRATION: "1"
+    cmds:
+      - go test -v -run TestIntegration -count=1 -timeout 120s
+
+  start:
+    desc: Build and run claude-bot (idempotent — no-op if already running)
+    deps: [default]
+    cmds:
+      - |
+        if [ -f {{.PID_FILE}} ] && kill -0 $(cat {{.PID_FILE}}) 2>/dev/null; then
+          echo "claude-bot already running (pid $(cat {{.PID_FILE}}))"
+          exit 0
+        fi
+        ./{{.BINARY}} &
+        echo $! > {{.PID_FILE}}
+        echo "claude-bot started (pid $(cat {{.PID_FILE}}))"
+
+  stop:
+    desc: Stop claude-bot (idempotent — no-op if not running)
+    cmds:
+      - |
+        if [ ! -f {{.PID_FILE}} ]; then
+          echo "claude-bot not running (no pid file)"
+          exit 0
+        fi
+        PID=$(cat {{.PID_FILE}})
+        if kill -0 "$PID" 2>/dev/null; then
+          kill "$PID"
+          echo "claude-bot stopped (pid $PID)"
+        else
+          echo "claude-bot not running (stale pid $PID)"
+        fi
+        rm -f {{.PID_FILE}}
+
+  restart:
+    desc: Stop and start claude-bot
+    cmds:
+      - task: stop
+      - task: start
+
+  clean:
+    desc: Remove build artifacts and bot state
+    cmds:
+      - task: stop
+      - cmd: rm -f {{.BINARY}}
+        platforms: [linux, darwin]
+      - cmd: del /f {{.BINARY}} 2>nul
+        platforms: [windows]
+      - cmd: rm -rf ~/.claude-bot/trees ~/.claude-bot/logs
+        platforms: [linux, darwin]
+      - cmd: rd /s /q "%USERPROFILE%\.claude-bot\trees" "%USERPROFILE%\.claude-bot\logs" 2>nul
+        platforms: [windows]
