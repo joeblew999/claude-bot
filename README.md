@@ -2,6 +2,11 @@
 
 Single Go binary that watches GitHub repos for `todo`-labeled issues, runs Claude Code, and creates PRs.
 
+
+https://github.com/joeblew999/claude-bot/
+https://github.com/joeblew999/claude-bot/releases/tag/latest
+
+
 ## Quick Start
 
 ```bash

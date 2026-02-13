@@ -22,6 +22,11 @@ tasks:
     cmds:
       - go test -v -run TestIntegration -count=1 -timeout 120s
 
+  release:
+    desc: Cross-compile all targets and publish GitHub release
+    cmds:
+      - go run . --release
+
   update:
     desc: Self-update from latest GitHub release
     cmds:

@@ -374,6 +374,9 @@ func main() {
 		case "--update":
 			selfUpdate()
 			return
+		case "--release":
+			selfRelease()
+			return
 		}
 	}
 
