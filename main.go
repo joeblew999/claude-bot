@@ -23,6 +23,11 @@ import (
 // --- Config ---
 // All env vars are prefixed with CB_ to avoid clashes with other tools.
 
+const defaultGreeting = "Hey there! Thanks for opening this issue — I'm on it. I'll have a PR ready for review shortly. Hang tight!"
+
+// greetingSignature is appended to greeting comments so the bot can identify its own greetings.
+const greetingSignature = "\n\n---\n*🤖 claude-bot is working on this*"
+
 type Config struct {
 	Repos        []string
 	PollInterval time.Duration
@@ -34,6 +39,7 @@ type Config struct {
 	RepoDir      string
 	LogDir       string
 	MaxTurns     int
+	Greeting     string
 }
 
 func loadConfig() Config {
@@ -47,6 +53,7 @@ func loadConfig() Config {
 		RepoDir:      expandHome("~/.claude-bot/repos"),
 		LogDir:       expandHome("~/.claude-bot/logs"),
 		MaxTurns:     50,
+		Greeting:     defaultGreeting,
 	}
 
 	if v := os.Getenv("CB_REPOS"); v != "" {
@@ -90,6 +97,9 @@ func loadConfig() Config {
 			cfg.MaxTurns = n
 		}
 	}
+	if v := os.Getenv("CB_GREETING"); v != "" {
+		cfg.Greeting = v
+	}
 
 	return cfg
 }
@@ -104,6 +114,9 @@ type Issue struct {
 	Labels   []Label   `json:"labels"`
 	URL      string    `json:"url"`
 	Comments []Comment `json:"comments"`
+	Author   struct {
+		Login string `json:"login"`
+	} `json:"author"`
 }
 
 type Label struct {
@@ -398,7 +411,7 @@ func fetchIssues(ctx context.Context, repo, label string) ([]Issue, error) {
 	out, err := run(ctx, "", "gh", "issue", "list",
 		"--repo", repo,
 		"--label", label,
-		"--json", "number,title,body,labels,url,comments",
+		"--json", "number,title,body,labels,url,comments,author",
 		"--limit", "50",
 	)
 	if err != nil {
@@ -465,6 +478,11 @@ func processIssue(ctx context.Context, cfg Config, workerID int, issue Issue) (r
 		if err := removeLabel(ctx, issue, cfg.IssueLabel); err != nil {
 			log.Printf("[worker-%d] warning: couldn't remove %s label: %v", workerID, cfg.IssueLabel, err)
 		}
+	}
+
+	// Step 1.5: Post friendly greeting (idempotent)
+	if err := greetIssue(ctx, cfg, issue); err != nil {
+		log.Printf("[worker-%d] warning: couldn't post greeting on %s: %v", workerID, issue.key(), err)
 	}
 
 	// Step 2: Ensure repo cloned (idempotent)
@@ -766,6 +784,51 @@ func commentOnIssue(ctx context.Context, issue Issue, body string) error {
 		"--body", body,
 	)
 	return err
+}
+
+// greetIssue posts a friendly greeting comment on the issue.
+// Idempotent: skips if a greeting (identified by the signature) was already posted.
+func greetIssue(ctx context.Context, cfg Config, issue Issue) error {
+	// Check existing comments for our greeting signature
+	for _, c := range issue.Comments {
+		if strings.Contains(c.Body, greetingSignature) {
+			return nil // Already greeted
+		}
+	}
+	// Also check latest comments from the API in case the issue data is stale
+	if anyCommentContains(ctx, issue, greetingSignature) {
+		return nil
+	}
+
+	greeting := cfg.Greeting
+	if author := issue.Author.Login; author != "" {
+		greeting = fmt.Sprintf("Hey @%s! %s", author, cfg.Greeting)
+	}
+	return commentOnIssue(ctx, issue, greeting+greetingSignature)
+}
+
+// anyCommentContains checks if any comment on an issue contains the given text.
+func anyCommentContains(ctx context.Context, issue Issue, text string) bool {
+	out, err := run(ctx, "", "gh", "issue", "view",
+		strconv.Itoa(issue.Number),
+		"--repo", issue.Repo,
+		"--json", "comments",
+	)
+	if err != nil {
+		return false
+	}
+	var result struct {
+		Comments []Comment `json:"comments"`
+	}
+	if json.Unmarshal([]byte(out), &result) != nil || len(result.Comments) == 0 {
+		return false
+	}
+	for _, c := range result.Comments {
+		if strings.Contains(c.Body, text) {
+			return true
+		}
+	}
+	return false
 }
 
 // lastCommentContains checks if the most recent comment on an issue contains the given text.
