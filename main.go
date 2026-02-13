@@ -32,8 +32,9 @@ type Config struct {
 	DoneLabel      string
 	NeedsInfoLabel string
 	FailedLabel    string
-	TriageLabel    string
-	Triage         bool
+	TriageLabel        string
+	Triage             bool
+	TriageDiscussions  bool
 	WorktreeDir    string
 	RepoDir        string
 	LogDir         string
@@ -119,6 +120,9 @@ func loadConfig() Config {
 	}
 	if os.Getenv("CB_TRIAGE") == "1" {
 		cfg.Triage = true
+	}
+	if os.Getenv("CB_TRIAGE_DISCUSSIONS") == "1" {
+		cfg.TriageDiscussions = true
 	}
 
 	return cfg
@@ -360,6 +364,12 @@ func main() {
 	// Self-management subcommands — no config needed
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "--version", "-v":
+			fmt.Printf("claude-bot %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
+			return
+		case "--help", "-h":
+			printUsage()
+			return
 		case "--build":
 			buildSelf()
 			return
@@ -427,6 +437,31 @@ func main() {
 	log.Println("claude-bot stopped")
 }
 
+func printUsage() {
+	fmt.Printf(`claude-bot %s — watches GitHub repos for todo-labeled issues, runs Claude Code, creates PRs.
+
+Usage:
+  claude-bot                Run the bot (requires CB_REPOS env var)
+  claude-bot --build        Build binary from source
+  claude-bot --release      Cross-compile and publish GitHub release
+  claude-bot --update       Self-update from latest GitHub release
+  claude-bot --clean        Remove worktrees and logs
+  claude-bot --clean-all    Full reset (worktrees, repos, logs)
+  claude-bot --version      Print version
+  claude-bot --help         Print this help
+
+Environment:
+  CB_REPOS          Comma-separated list of owner/repo to watch (required)
+  CB_POLL_INTERVAL  How often to poll (default: 30s)
+  CB_WORKERS        Parallel workers (default: 3)
+  CB_MAX_TURNS      Max Claude turns per issue (default: 50)
+  CB_MAX_RETRIES    Max retries before marking failed (default: 3)
+  CB_TRIAGE=1                Enable triage (respond to new issues via Claude)
+  CB_TRIAGE_DISCUSSIONS=1    Also triage GitHub Discussions
+  CB_AUTO_INSTALL=1          Auto-install missing dependencies
+`, version)
+}
+
 // --- Poll Loop ---
 
 func pollLoop(ctx context.Context, cfg Config, jobs chan<- Issue, t *tracker) {
@@ -455,6 +490,11 @@ func poll(ctx context.Context, cfg Config, jobs chan<- Issue, t *tracker) {
 		// Triage: find unlabeled issues and respond
 		if cfg.Triage {
 			triageNewIssues(ctx, cfg, repo)
+		}
+
+		// Triage discussions
+		if cfg.TriageDiscussions {
+			triageNewDiscussions(ctx, cfg, repo)
 		}
 
 		issues, err := fetchIssues(ctx, repo, cfg.IssueLabel)
@@ -577,6 +617,123 @@ func hasBotComment(issue Issue) bool {
 		}
 	}
 	return false
+}
+
+// --- Discussion Triage ---
+
+type Discussion struct {
+	ID     string `json:"id"`
+	Number int    `json:"number"`
+	Title  string `json:"title"`
+	Body   string `json:"body"`
+	Author struct {
+		Login string `json:"login"`
+	} `json:"author"`
+	Comments struct {
+		Nodes []struct {
+			Body string `json:"body"`
+		} `json:"nodes"`
+	} `json:"comments"`
+	Repo string `json:"-"`
+}
+
+func (d Discussion) key() string {
+	return fmt.Sprintf("%s#d%d", d.Repo, d.Number)
+}
+
+// triageNewDiscussions finds unanswered discussions and responds via Claude.
+// Idempotent: skips discussions that already have a bot comment.
+func triageNewDiscussions(ctx context.Context, cfg Config, repo string) {
+	parts := strings.SplitN(repo, "/", 2)
+	if len(parts) != 2 {
+		return
+	}
+	owner, name := parts[0], parts[1]
+
+	query := fmt.Sprintf(`{
+		repository(owner: %q, name: %q) {
+			discussions(first: 20, orderBy: {field: CREATED_AT, direction: DESC}) {
+				nodes {
+					id number title body
+					author { login }
+					comments(first: 10) { nodes { body } }
+				}
+			}
+		}
+	}`, owner, name)
+
+	out, err := run(ctx, "", "gh", "api", "graphql", "-f", "query="+query)
+	if err != nil {
+		log.Printf("[triage-discussions] error fetching from %s: %v", repo, err)
+		return
+	}
+
+	var result struct {
+		Data struct {
+			Repository struct {
+				Discussions struct {
+					Nodes []Discussion `json:"nodes"`
+				} `json:"discussions"`
+			} `json:"repository"`
+		} `json:"data"`
+	}
+	if json.Unmarshal([]byte(out), &result) != nil {
+		return
+	}
+
+	for _, d := range result.Data.Repository.Discussions.Nodes {
+		d.Repo = repo
+
+		// Skip if bot already commented
+		hasBot := false
+		for _, c := range d.Comments.Nodes {
+			if strings.Contains(c.Body, botCommentMarker) {
+				hasBot = true
+				break
+			}
+		}
+		if hasBot {
+			continue
+		}
+
+		log.Printf("[triage-discussions] responding to %s: %q", d.key(), d.Title)
+
+		response := buildDiscussionResponse(ctx, d)
+
+		// Add comment via GraphQL mutation
+		mutation := fmt.Sprintf(`mutation { addDiscussionComment(input: {discussionId: %q, body: %q}) { comment { id } } }`,
+			d.ID, response+"\n"+botCommentMarker)
+
+		if _, err := run(ctx, "", "gh", "api", "graphql", "-f", "query="+mutation); err != nil {
+			log.Printf("[triage-discussions] error commenting on %s: %v", d.key(), err)
+		}
+	}
+}
+
+// buildDiscussionResponse generates a Claude-powered response for a discussion.
+func buildDiscussionResponse(ctx context.Context, d Discussion) string {
+	prompt := fmt.Sprintf(`You are responding to a GitHub Discussion as a helpful project contributor.
+Write a short, friendly, human-sounding reply. DO NOT say you are a bot.
+Just respond naturally as if you're a person on the team.
+
+- If they asked a question, try to help or point them in the right direction.
+- If they're sharing an idea, engage with it constructively.
+- Keep it to 2-4 sentences max. Be warm but concise.
+
+Discussion title: %s
+Discussion author: @%s
+Discussion body:
+%s`, d.Title, d.Author.Login, d.Body)
+
+	cmd := exec.CommandContext(ctx, "claude", "-p", prompt, "--max-turns", "1")
+	cmd.Env = filterEnv(os.Environ(), "CLAUDECODE")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("[triage-discussions] claude failed, using fallback: %v", err)
+		return fmt.Sprintf("Hey @%s, thanks for starting this discussion! A maintainer will chime in soon.", d.Author.Login)
+	}
+
+	return strings.TrimSpace(string(out))
 }
 
 // buildTriageResponse uses Claude CLI to generate a context-aware, human-sounding

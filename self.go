@@ -17,6 +17,9 @@ const (
 	repoName   = "claude-bot"
 )
 
+// version is set at build time via -ldflags.
+var version = "dev"
+
 var targets = []struct{ goos, goarch string }{
 	{"linux", "amd64"},
 	{"linux", "arm64"},
@@ -35,11 +38,26 @@ func binaryPath() string {
 	return name
 }
 
+// gitCommit returns the short commit hash, or "unknown" if not in a git repo.
+func gitCommit() string {
+	out, err := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// ldflags returns the -ldflags string to embed version info.
+func ldflags(commit string) string {
+	return fmt.Sprintf("-X main.version=%s", commit)
+}
+
 // buildSelf compiles the binary from source for the current platform.
 func buildSelf() {
 	out := binaryPath()
-	log.Printf("[build] building %s...", out)
-	cmd := exec.Command("go", "build", "-o", out, ".")
+	commit := gitCommit()
+	log.Printf("[build] building %s (%s)...", out, commit)
+	cmd := exec.Command("go", "build", "-ldflags", ldflags(commit), "-o", out, ".")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -51,12 +69,10 @@ func buildSelf() {
 // selfRelease cross-compiles all targets, tags, and publishes a GitHub release.
 // Requires: go, gh (authenticated).
 func selfRelease() {
-	// Get current commit for the tag
-	out, err := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
-	if err != nil {
-		log.Fatalf("[release] can't get git commit: %v", err)
+	commit := gitCommit()
+	if commit == "unknown" {
+		log.Fatalf("[release] can't get git commit — not in a git repo?")
 	}
-	commit := strings.TrimSpace(string(out))
 
 	// Cross-compile all targets
 	var assets []string
@@ -67,7 +83,7 @@ func selfRelease() {
 		}
 
 		log.Printf("[release] building %s...", name)
-		cmd := exec.Command("go", "build", "-o", name, ".")
+		cmd := exec.Command("go", "build", "-ldflags", ldflags(commit), "-o", name, ".")
 		cmd.Env = append(os.Environ(), "GOOS="+t.goos, "GOARCH="+t.goarch, "CGO_ENABLED=0")
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
