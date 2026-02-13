@@ -96,6 +96,63 @@ func TestCountBotErrors(t *testing.T) {
 	}
 }
 
+func TestHasBotComment(t *testing.T) {
+	// User mentioning "claude-bot" should NOT be detected as a bot comment
+	userIssue := Issue{Comments: []Comment{{Body: "I love claude-bot!"}}}
+	if hasBotComment(userIssue) {
+		t.Error("user comment should not be detected as bot comment")
+	}
+
+	// Bot comment with marker SHOULD be detected
+	botIssue := Issue{Comments: []Comment{{Body: "Hey thanks!\n" + botCommentMarker}}}
+	if !hasBotComment(botIssue) {
+		t.Error("bot comment with marker should be detected")
+	}
+
+	// No comments at all
+	emptyIssue := Issue{}
+	if hasBotComment(emptyIssue) {
+		t.Error("empty issue should not have bot comment")
+	}
+}
+
+func TestLoadDotEnvQuotes(t *testing.T) {
+	// Create a temp .env file with quoted values
+	dir := t.TempDir()
+	envFile := dir + "/.env"
+	os.WriteFile(envFile, []byte("TEST_DQ=\"double quoted\"\nTEST_SQ='single quoted'\nTEST_NQ=no quotes\n"), 0644)
+
+	// Save cwd, change to temp dir, run loadDotEnv, restore cwd
+	origDir, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(origDir)
+
+	// Clear test env vars
+	t.Setenv("TEST_DQ", "")
+	t.Setenv("TEST_SQ", "")
+	t.Setenv("TEST_NQ", "")
+	os.Unsetenv("TEST_DQ")
+	os.Unsetenv("TEST_SQ")
+	os.Unsetenv("TEST_NQ")
+
+	loadDotEnv()
+
+	if v := os.Getenv("TEST_DQ"); v != "double quoted" {
+		t.Errorf("TEST_DQ = %q, want %q", v, "double quoted")
+	}
+	if v := os.Getenv("TEST_SQ"); v != "single quoted" {
+		t.Errorf("TEST_SQ = %q, want %q", v, "single quoted")
+	}
+	if v := os.Getenv("TEST_NQ"); v != "no quotes" {
+		t.Errorf("TEST_NQ = %q, want %q", v, "no quotes")
+	}
+
+	// Clean up
+	os.Unsetenv("TEST_DQ")
+	os.Unsetenv("TEST_SQ")
+	os.Unsetenv("TEST_NQ")
+}
+
 func TestFilterEnv(t *testing.T) {
 	env := []string{"PATH=/usr/bin", "CLAUDECODE=1", "HOME=/home/user", "CLAUDECODEMORE=x"}
 	filtered := filterEnv(env, "CLAUDECODE")

@@ -357,17 +357,9 @@ func installNpm(pkg string) {
 // --- Main ---
 
 func main() {
-	cfg := loadConfig()
-
-	// Handle subcommands
+	// Self-management subcommands — no config needed
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
-		case "--clean":
-			cleanState(cfg)
-			return
-		case "--clean-all":
-			cleanEverything(cfg)
-			return
 		case "--build":
 			buildSelf()
 			return
@@ -376,6 +368,20 @@ func main() {
 			return
 		case "--release":
 			selfRelease()
+			return
+		}
+	}
+
+	cfg := loadConfig()
+
+	// Config-dependent subcommands
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--clean":
+			cleanState(cfg)
+			return
+		case "--clean-all":
+			cleanEverything(cfg)
 			return
 		}
 	}
@@ -559,10 +565,14 @@ func triageNewIssues(ctx context.Context, cfg Config, repo string) {
 	}
 }
 
+// botCommentMarker is a hidden HTML comment embedded in all bot-generated comments.
+// Using an invisible marker avoids false positives from users mentioning "claude-bot".
+const botCommentMarker = "<!-- claude-bot -->"
+
 // hasBotComment checks if claude-bot has already commented on the issue.
 func hasBotComment(issue Issue) bool {
 	for _, c := range issue.Comments {
-		if strings.Contains(c.Body, "claude-bot") {
+		if strings.Contains(c.Body, botCommentMarker) {
 			return true
 		}
 	}
@@ -700,7 +710,7 @@ func processIssue(ctx context.Context, cfg Config, workerID int, issue Issue) (r
 	}
 
 	// Step 9: Create PR (idempotent — skip if exists)
-	prURL, err := ensurePR(ctx, issue, branch, wtDir)
+	prURL, err := ensurePR(ctx, issue, branch, repoDir)
 	if err != nil {
 		return fmt.Errorf("creating PR: %w", err)
 	}
@@ -750,15 +760,6 @@ func ensureWorktree(ctx context.Context, repoDir, wtDir, branch string) error {
 		return nil
 	}
 
-	// Determine default branch
-	defaultBranch := "main"
-	if out, err := run(ctx, repoDir, "git", "symbolic-ref", "refs/remotes/origin/HEAD"); err == nil {
-		parts := strings.Split(strings.TrimSpace(out), "/")
-		if len(parts) > 0 {
-			defaultBranch = parts[len(parts)-1]
-		}
-	}
-
 	// Check if branch already exists remotely
 	if _, err := run(ctx, repoDir, "git", "rev-parse", "--verify", "refs/remotes/origin/"+branch); err == nil {
 		// Branch exists remotely — delete stale local branch if any, then check it out
@@ -770,8 +771,9 @@ func ensureWorktree(ctx context.Context, repoDir, wtDir, branch string) error {
 	// Delete stale local branch if it exists (left over from a previous failed run)
 	_ = deleteLocalBranch(ctx, repoDir, branch)
 
-	// Create new worktree with new branch from origin/defaultBranch
-	_, err := run(ctx, repoDir, "git", "worktree", "add", "-b", branch, wtDir, "origin/"+defaultBranch)
+	// Create new worktree with new branch from origin/default
+	base := defaultBranch(ctx, repoDir)
+	_, err := run(ctx, repoDir, "git", "worktree", "add", "-b", branch, wtDir, "origin/"+base)
 	return err
 }
 
@@ -813,7 +815,7 @@ func commitChanges(ctx context.Context, wtDir string, issue Issue) error {
 	return err
 }
 
-func ensurePR(ctx context.Context, issue Issue, branch, wtDir string) (string, error) {
+func ensurePR(ctx context.Context, issue Issue, branch, repoDir string) (string, error) {
 	// Check if PR already exists for this branch
 	out, err := run(ctx, "", "gh", "pr", "list",
 		"--repo", issue.Repo,
@@ -828,8 +830,11 @@ func ensurePR(ctx context.Context, issue Issue, branch, wtDir string) (string, e
 		}
 	}
 
+	// Detect default branch (don't hardcode "main")
+	baseBranch := defaultBranch(ctx, repoDir)
+
 	// Get diff stat for PR body
-	diffStat, _ := run(ctx, wtDir, "git", "diff", "--stat", "HEAD~1")
+	diffStat, _ := run(ctx, repoDir, "git", "diff", "--stat", "HEAD~1")
 
 	body := fmt.Sprintf("Closes #%d\n\n## What changed\n```\n%s\n```\n\n## Issue\n%s\n\n---\n*Automated by claude-bot. Review before merging.*",
 		issue.Number, diffStat, issue.URL)
@@ -841,7 +846,7 @@ func ensurePR(ctx context.Context, issue Issue, branch, wtDir string) (string, e
 		"--title", title,
 		"--body", body,
 		"--head", branch,
-		"--base", "main",
+		"--base", baseBranch,
 	)
 	if err != nil {
 		return "", err
@@ -850,16 +855,32 @@ func ensurePR(ctx context.Context, issue Issue, branch, wtDir string) (string, e
 	return strings.TrimSpace(prOut), nil
 }
 
-func ensurePRComment(ctx context.Context, issue Issue, prURL string) error {
-	// Fetch latest comments to check if we already commented
-	issues, err := fetchIssues(ctx, issue.Repo, "")
+// defaultBranch detects the repo's default branch from origin/HEAD.
+// Falls back to "main" if detection fails.
+func defaultBranch(ctx context.Context, repoDir string) string {
+	out, err := run(ctx, repoDir, "git", "symbolic-ref", "refs/remotes/origin/HEAD")
 	if err == nil {
-		for _, iss := range issues {
-			if iss.Number == issue.Number {
-				for _, c := range iss.Comments {
-					if strings.Contains(c.Body, prURL) {
-						return nil // Already commented
-					}
+		parts := strings.Split(strings.TrimSpace(out), "/")
+		if len(parts) > 0 {
+			return parts[len(parts)-1]
+		}
+	}
+	return "main"
+}
+
+func ensurePRComment(ctx context.Context, issue Issue, prURL string) error {
+	// Check this specific issue's comments (not all issues)
+	out, err := run(ctx, "", "gh", "issue", "view",
+		strconv.Itoa(issue.Number),
+		"--repo", issue.Repo,
+		"--json", "comments",
+	)
+	if err == nil {
+		var result struct{ Comments []Comment `json:"comments"` }
+		if json.Unmarshal([]byte(out), &result) == nil {
+			for _, c := range result.Comments {
+				if strings.Contains(c.Body, prURL) {
+					return nil // Already commented
 				}
 			}
 		}
@@ -940,10 +961,11 @@ func removeLabel(ctx context.Context, issue Issue, label string) error {
 }
 
 func commentOnIssue(ctx context.Context, issue Issue, body string) error {
+	// Embed invisible marker so hasBotComment can reliably detect bot comments
 	_, err := run(ctx, "", "gh", "issue", "comment",
 		strconv.Itoa(issue.Number),
 		"--repo", issue.Repo,
-		"--body", body,
+		"--body", body+"\n"+botCommentMarker,
 	)
 	return err
 }
@@ -1102,6 +1124,10 @@ func loadDotEnv() {
 		}
 		k = strings.TrimSpace(k)
 		v = strings.TrimSpace(v)
+		// Strip surrounding quotes (KEY="value" or KEY='value')
+		if len(v) >= 2 && ((v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'')) {
+			v = v[1 : len(v)-1]
+		}
 		// Don't override existing env vars
 		if os.Getenv(k) == "" {
 			os.Setenv(k, v)
