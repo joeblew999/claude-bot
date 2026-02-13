@@ -359,7 +359,7 @@ func installNpm(pkg string) {
 func main() {
 	cfg := loadConfig()
 
-	// Handle clean commands
+	// Handle subcommands
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "--clean":
@@ -367,6 +367,12 @@ func main() {
 			return
 		case "--clean-all":
 			cleanEverything(cfg)
+			return
+		case "--build":
+			buildSelf()
+			return
+		case "--update":
+			selfUpdate()
 			return
 		}
 	}

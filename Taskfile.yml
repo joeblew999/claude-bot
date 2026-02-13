@@ -4,7 +4,6 @@ version: '3'
 
 vars:
   BINARY: '{{if eq OS "windows"}}claude-bot.exe{{else}}claude-bot{{end}}'
-  PID_FILE: '.claude-bot.pid'
 
 tasks:
   default:
@@ -31,30 +30,17 @@ tasks:
     deps: [default]
     cmds:
       - |
-        if [ -f {{.PID_FILE}} ] && kill -0 $(cat {{.PID_FILE}}) 2>/dev/null; then
-          echo "claude-bot already running (pid $(cat {{.PID_FILE}}))"
-          exit 0
+        if pgrep -f './claude-bot' > /dev/null 2>&1; then
+          echo "claude-bot already running"
+        else
+          nohup ./{{.BINARY}} >> ~/.claude-bot/bot.log 2>&1 &
+          echo "claude-bot started (logs at ~/.claude-bot/bot.log)"
         fi
-        ./{{.BINARY}} &
-        echo $! > {{.PID_FILE}}
-        echo "claude-bot started (pid $(cat {{.PID_FILE}}))"
 
   stop:
     desc: Stop claude-bot (idempotent — no-op if not running)
     cmds:
-      - |
-        if [ ! -f {{.PID_FILE}} ]; then
-          echo "claude-bot not running (no pid file)"
-          exit 0
-        fi
-        PID=$(cat {{.PID_FILE}})
-        if kill -0 "$PID" 2>/dev/null; then
-          kill "$PID"
-          echo "claude-bot stopped (pid $PID)"
-        else
-          echo "claude-bot not running (stale pid $PID)"
-        fi
-        rm -f {{.PID_FILE}}
+      - pkill -f './claude-bot' 2>/dev/null && echo "claude-bot stopped" || echo "claude-bot not running"
 
   restart:
     desc: Stop and start claude-bot
