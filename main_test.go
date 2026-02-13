@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"testing"
 )
 
@@ -18,10 +17,7 @@ func TestGreetingSignatureNotEmpty(t *testing.T) {
 }
 
 func TestLoadConfigDefaultGreeting(t *testing.T) {
-	// Clear env to avoid side effects
-	orig := os.Getenv("CB_GREETING")
-	os.Unsetenv("CB_GREETING")
-	defer os.Setenv("CB_GREETING", orig)
+	t.Setenv("CB_GREETING", "")
 
 	cfg := loadConfig()
 	if cfg.Greeting != defaultGreeting {
@@ -31,8 +27,7 @@ func TestLoadConfigDefaultGreeting(t *testing.T) {
 
 func TestLoadConfigCustomGreeting(t *testing.T) {
 	custom := "Hello friend! Working on your issue now."
-	os.Setenv("CB_GREETING", custom)
-	defer os.Unsetenv("CB_GREETING")
+	t.Setenv("CB_GREETING", custom)
 
 	cfg := loadConfig()
 	if cfg.Greeting != custom {
@@ -161,6 +156,26 @@ func TestTrackerAcquireRelease(t *testing.T) {
 	tr.release("key1")
 	if !tr.tryAcquire("key1") {
 		t.Error("acquire after release should succeed")
+	}
+}
+
+func TestIssueAuthorLogin(t *testing.T) {
+	issue := Issue{}
+	issue.Author.Login = "testuser"
+	if issue.Author.Login != "testuser" {
+		t.Errorf("Author.Login = %q, want %q", issue.Author.Login, "testuser")
+	}
+}
+
+func TestExpandHome(t *testing.T) {
+	got := expandHome("/absolute/path")
+	if got != "/absolute/path" {
+		t.Errorf("expandHome(/absolute/path) = %q, want /absolute/path", got)
+	}
+
+	got = expandHome("~/test")
+	if containsStr(got, "~") {
+		t.Errorf("expandHome(~/test) should not contain ~, got %q", got)
 	}
 }
 
